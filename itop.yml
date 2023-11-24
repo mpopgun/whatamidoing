@@ -1,0 +1,172 @@
+---
+- name: Install and Configure iTop
+  hosts: all  # Replace with your target hosts or group
+  become: yes
+  vars:
+    itop_db_user: "itop_user"  # Define your default database user here, use this when the wizard asks for db user
+
+  tasks:
+    - name: Update APT Package List
+      apt:
+        update_cache: yes
+
+    - name: Install required packages for iTop
+      apt:
+        name: "{{ item }}"
+        state: present
+      with_items:
+        - apache2
+        - mariadb-server
+        - php7.4
+        - php7.4-mysql
+        - php7.4-ldap
+        - php7.4-cli
+        - php7.4-soap
+        - php7.4-json
+        - graphviz
+        - php7.4-xml
+        - php7.4-gd
+        - php7.4-zip
+        - php7.4-fpm
+        - php7.4-mbstring
+        - php7.4-curl
+        - acl
+        - rsync
+
+    - name: Detect Python version
+      debug:
+        var: ansible_python_version
+
+    - name: Install MySQL module for Python 2.7
+      package:
+        name: python-mysqldb
+        state: present
+      when: "'2.7' in ansible_python_version"
+
+    - name: Install MySQL module for Python 3.X
+      package:
+        name: python3-mysqldb
+        state: present
+      when: "'3' in ansible_python_version"
+
+    - name: Download iTop archive
+      get_url:
+        url: "https://sourceforge.net/projects/itop/files/latest/download"
+        dest: "/tmp/itop.zip"
+
+    - name: Extract iTop archive
+      command: unzip -o /tmp/itop.zip -d /var/www/html/itop
+      become_user: root
+
+    - name: Create install.sh file mv -f
+      copy:
+        content: |
+          #!/bin/bash
+          sudo mv -f /var/www/html/itop/web/* /var/www/html/itop
+          sudo rm -rf /var/www/html/itop/web
+          sudo setfacl -dR -m u:"www-data":rwX /var/www/html/itop/data /var/www/html/itop/log
+          sudo setfacl -R -m u:"www-data":rwX /var/www/html/itop/data /var/www/html/itop/log
+          sudo mkdir -p /var/www/html/itop/conf /var/www/html/itop/env-production /var/www/html/itop/env-production-build
+          sudo chown www-data: /var/www/html/itop/conf /var/www/html/itop/env-production /var/www/html/itop/env-production-build
+        dest: /install.sh
+        mode: '0755'  # Make the script executable
+
+
+    - name: Run install.sh asynchronously
+      become: yes
+      shell: /install.sh  # You may need to specify the full path to install.sh
+      async: 300  # Set a reasonable timeout
+      poll: 0
+      register: install_result
+    
+    - name: Wait for the install.sh job to finish
+      async_status:
+        jid: "{{ install_result.ansible_job_id }}"
+      register: job_result
+      until: job_result.finished
+      retries: 300  # Adjust the number of retries if needed
+    
+    - name: Display install.sh output
+      debug:
+        var: job_result.stdout_lines + job_result.stderr_lines
+
+
+    - name: Restart Apache
+      service:
+        name: apache2
+        state: restarted
+
+    - name: Check Apache Status
+      service_facts:
+      register: apache_status
+
+    - name: Display Apache Status
+      debug:
+        var: apache_status.ansible_facts.services["apache2"].state
+
+
+#
+#    - name: install rsync on the ansible controller
+#      connection: local
+#      apt:
+#        update_cache: yes
+#        name: apt-get
+#        state: present
+#
+#    - name: Synchronize files
+#      become: yes
+#      synchronize:
+#        src: /var/www/html/itop/web/
+#        dest: /var/www/html/itop/
+#        recursive: yes
+#        delete: yes
+#
+#
+
+    - name: Set iTop directory ownership and additional permissions
+      file:
+        path: "{{ item }}"
+        owner: www-data
+        group: www-data
+        mode: '0775'
+        recurse: yes
+      loop:
+        - /var/www/html/itop/conf
+        - /var/www/html/itop/data
+        - /var/www/html/itop/env-production
+        - /var/www/html/itop/env-production-build
+
+    - name: Generate a random strong password for MariaDB user
+      shell: pwgen -s 20 1
+      register: mysql_root_password
+      changed_when: false  # Mark the task as unchanged to prevent triggering handlers
+
+    - name: Echo generated password, you'll need this for the setup wizard
+      debug:
+        var: mysql_root_password.stdout
+
+    - name: Configure MariaDB for iTop
+      mysql_db:
+        name: "iTop_db"  # Hard-set the database name, change it in all 3 sections if needed
+        state: present
+      notify:
+        - Restart MariaDB
+
+    - name: Create MariaDB user for iTop
+      mysql_user:
+        name: "{{ itop_db_user }}"
+        password: "{{ mysql_root_password.stdout }}"
+        priv: "iTop_db.*:ALL"  # Update the database name
+        state: present
+
+  handlers:
+    - name: Reload Apache
+      service:
+        name: apache2
+        state: reloaded
+
+    - name: Restart MariaDB
+      service:
+        name: mysql
+        state: restarted
+
